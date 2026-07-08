@@ -6278,8 +6278,8 @@ function renderSyncChip() {
     el.title = 'ข้อมูลรวมล่าสุดจาก Google Sheets · คลิกเพื่อซิงก์ทันที';
   } else if (syncState.status === 'offline') {
     el.classList.add('sync-warn');
-    el.textContent = '⚠ ซิงก์ไม่สำเร็จ — คลิกเพื่อลองใหม่';
-    el.title = 'เชื่อมต่อ Google Sheets ไม่ได้ (ออฟไลน์/สคริปต์ผิดพลาด) ข้อมูลยังบันทึกในเครื่องนี้ตามปกติ และจะลองซิงก์ใหม่อัตโนมัติ';
+    el.textContent = '⚠ ซิงก์ไม่สำเร็จ — คลิกดูสาเหตุ/ลองใหม่';
+    el.title = syncState.lastError || 'เชื่อมต่อ Google Sheets ไม่ได้ ข้อมูลยังบันทึกในเครื่องนี้ตามปกติ และจะลองซิงก์ใหม่อัตโนมัติ';
   } else {
     el.classList.add('sync-warn');
     el.textContent = '☁ Sync: รอเริ่ม';
@@ -6301,26 +6301,76 @@ function scheduleSyncPush() {
   syncPushTimer = setTimeout(() => syncNow('change'), 2500);
 }
 
+// fetch with a hard timeout — a hung request must become a caught error,
+// never an eternal "กำลังซิงก์…".
+async function fetchWithTimeout(url, opts, ms) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), ms);
+  try {
+    return await fetch(url, { ...opts, signal: ctrl.signal });
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+// Read + validate a sync response. Produces a precise Thai diagnostic instead
+// of a generic failure, so the chip can say exactly what's wrong.
+async function parseSyncResponse(resp, stage) {
+  if (!resp.ok) {
+    throw new Error(stage + ': เซิร์ฟเวอร์ตอบ HTTP ' + resp.status +
+      (resp.status === 404 ? ' — ตรวจว่า URL ลงท้ายด้วย /exec และ Deploy แล้ว' : ''));
+  }
+  const text = await resp.text();
+  const head = text.trim().slice(0, 1);
+  if (head === '<') {
+    // Got an HTML page (Google login / error page) instead of JSON
+    throw new Error(stage + ': ได้ HTML แทน JSON — ตรวจการ Deploy: Execute as = Me, Who has access = Anyone (ไม่ใช่ "Anyone with Google account") และ URL ต้องเป็นของ deployment ล่าสุด');
+  }
+  try {
+    return JSON.parse(text);
+  } catch (_) {
+    throw new Error(stage + ': ตอบกลับไม่ใช่ JSON (' + text.trim().slice(0, 60) + '…)');
+  }
+}
+
+let syncReady = false;        // set after initial loadHistory — prevents an early
+                              // pull/push racing against (and being wiped by) the local load
+let syncStartedAt = 0;
+
 async function syncNow(reason) {
   if (!SYNC_URL) { syncState.status = 'unconfigured'; renderSyncChip(); return; }
-  if (syncState.inProgress) { syncState.queued = true; return; }
+  if (!syncReady) return;
+  if (syncState.inProgress) {
+    // Watchdog: if a previous run somehow got stuck > 60s, force-reset so the
+    // system self-heals instead of queueing behind a zombie forever.
+    if (Date.now() - syncStartedAt > 60000) {
+      console.warn('sync watchdog: previous run stuck > 60s — resetting');
+      syncState.inProgress = false;
+    } else {
+      syncState.queued = true;
+      return;
+    }
+  }
   syncState.inProgress = true;
-  syncState.status = 'syncing';
-  renderSyncChip();
+  syncStartedAt = Date.now();
   try {
-    // 1) PULL — always fetch the sheet first
-    const pr = await fetch(SYNC_URL + '?action=pull&t=' + Date.now(), { method: 'GET' });
-    const pdata = await pr.json();
+    syncState.status = 'syncing';
+    syncState.lastError = null;
+    renderSyncChip();
+
+    // 1) PULL — always fetch the sheet first (20s timeout)
+    const pr = await fetchWithTimeout(SYNC_URL + '?action=pull&t=' + Date.now(), { method: 'GET' }, 20000);
+    const pdata = await parseSyncResponse(pr, 'Pull');
     checkScriptVersion(pdata);
     let changed = mergeRemoteCases(pdata.cases);
 
-    // 2) PUSH the combined set (server merges again under a lock, returns final set)
-    const qr = await fetch(SYNC_URL, {
+    // 2) PUSH the combined set (server merges again under a lock; 30s timeout)
+    const qr = await fetchWithTimeout(SYNC_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // avoids CORS preflight with Apps Script
       body: JSON.stringify({ action: 'push', cases: entriesToWire() })
-    });
-    const qdata = await qr.json();
+    }, 30000);
+    const qdata = await parseSyncResponse(qr, 'Push');
     checkScriptVersion(qdata);
     if (Array.isArray(qdata.cases)) changed = mergeRemoteCases(qdata.cases) || changed;
 
@@ -6332,7 +6382,11 @@ async function syncNow(reason) {
     syncState.lastOk = new Date();
     syncState.status = 'ok';
   } catch (err) {
-    console.warn('sync failed (' + reason + '):', err);
+    const msg = (err && err.name === 'AbortError')
+      ? 'หมดเวลารอการตอบกลับ (เครือข่ายช้า/ถูกบล็อก หรือสคริปต์ทำงานนานเกินไป)'
+      : (err && err.message) || String(err);
+    syncState.lastError = msg;
+    console.warn('sync failed (' + reason + '):', msg);
     syncState.status = 'offline';
     scheduleSyncRetry();
   } finally {
@@ -6342,9 +6396,18 @@ async function syncNow(reason) {
   }
 }
 
-// Manual sync on chip click
+// Manual sync on chip click; when in error state, show the full diagnostic first
 document.addEventListener('click', e => {
-  if (e.target && e.target.id === 'syncChip' && SYNC_URL) syncNow('manual');
+  if (!(e.target && e.target.id === 'syncChip' && SYNC_URL)) return;
+  if (syncState.status === 'offline' && syncState.lastError) {
+    alert('สาเหตุที่ซิงก์ไม่สำเร็จ:\n\n' + syncState.lastError +
+      '\n\nรายการตรวจสอบ:\n' +
+      '1. URL ใน SYNC_URL ต้องลงท้ายด้วย /exec\n' +
+      '2. Deploy → Web app → Execute as: Me · Who has access: Anyone\n' +
+      '3. หลังแก้โค้ดสคริปต์ ต้อง Deploy → Manage deployments → Edit → New version\n' +
+      '4. เครื่องต้องออกอินเทอร์เน็ตถึง script.google.com ได้\n\nกด OK เพื่อลองซิงก์อีกครั้ง');
+  }
+  syncNow('manual');
 });
 // Auto-pull whenever the tab becomes visible again
 document.addEventListener('visibilitychange', () => {
@@ -7092,7 +7155,7 @@ $('o_date').value = today;
 toggleInrBlock();
 updateM13Preview();
 updateOtherPreview();
-loadHistory().then(() => { renderSyncChip(); syncNow('startup'); });
+loadHistory().then(() => { syncReady = true; renderSyncChip(); syncNow('startup'); });
 loadDrugList();
 loadComplList();
 loadTemplateList();
