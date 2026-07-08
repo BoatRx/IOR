@@ -1614,7 +1614,7 @@
 // ║    → Edit → Version: New version มิฉะนั้นชีตจะยังรันโค้ดเก่า             ║
 // ╚════════════════════════════════════════════════════════════════════╝
 const SYNC_URL = 'https://script.google.com/macros/s/AKfycbwSULdt-dHP9_pQwXZ3C_BLp3KKJnguxt7ELlalOVzGfh2co3L-FoL38H5BK3FzMkfrJQ/exec'; // ← วาง Web App URL (…/exec) ที่นี่
-const EXPECTED_SCRIPT_VERSION = 1; // ต้องตรงกับ SCRIPT_VERSION ในโค้ด Apps Script
+const EXPECTED_SCRIPT_VERSION = 2; // ต้องตรงกับ SCRIPT_VERSION ในโค้ด Apps Script (v2 = รองรับ sync รายการยา/ภาวะแทรกซ้อน/Template)
 
 // ============= STORAGE BACKEND =============
 // window.storage is Claude.ai's artifact storage API — it exists ONLY when this
@@ -2031,6 +2031,7 @@ async function persistTemplates() {
       try { await storageBackend.delete('templates_custom'); } catch(_){}
     }
   } catch (e) { console.warn('Template save failed:', e); }
+  touchSetting('templates');
 }
 
 async function saveTemplatesAsDefault() {
@@ -2039,6 +2040,7 @@ async function saveTemplatesAsDefault() {
     await storageSet('templates_baseline', JSON.stringify(templateBaseline));
     try { await storageBackend.delete('templates_custom'); } catch(_){}
   } catch (e) { console.warn('Save template baseline failed:', e); }
+  touchSetting('templates');
   renderTemplateManageList();
 }
 
@@ -4960,6 +4962,7 @@ async function saveComplAsDefault() {
     await storageSet('compl_list_baseline', JSON.stringify(complBaseline));
     try { await storageBackend.delete('compl_list_custom'); } catch(_){}
   } catch (e) { console.warn('Save compl baseline failed:', e); }
+  touchSetting('complList');
   renderComplManageList();
 }
 
@@ -5001,6 +5004,7 @@ async function persistCompl() {
       try { await storageBackend.delete('compl_list_custom'); } catch(_){}
     }
   } catch (e) { console.warn('Compl save failed:', e); }
+  touchSetting('complList');
 }
 
 async function loadComplList() {
@@ -5073,6 +5077,7 @@ async function persistDrugs() {
       try { await storageBackend.delete('drug_list_custom'); } catch(_){}
     }
   } catch (e) { console.warn('Drug list save failed:', e); }
+  touchSetting('drugList');
 }
 
 async function saveDrugsAsDefault() {
@@ -5082,6 +5087,7 @@ async function saveDrugsAsDefault() {
     // Current now equals baseline, so the "custom override" is no longer needed
     try { await storageBackend.delete('drug_list_custom'); } catch(_){}
   } catch (e) { console.warn('Save drug baseline failed:', e); }
+  touchSetting('drugList');
   refreshDrugStatus();
   renderDrugManageList();
 }
@@ -6333,6 +6339,122 @@ async function parseSyncResponse(resp, stage) {
   }
 }
 
+// ----- Shared settings sync (drug list / complications / templates) -----
+// Each list syncs as ONE versioned document {baseline, current}: the higher rev
+// wins whole-document (the most recent edit anywhere becomes the standard on
+// every device). Cases keep their per-entry merge; these are admin-managed
+// config lists, so last-writer-wins is the predictable rule.
+const SETTING_KEYS = ['drugList', 'complList', 'templates'];
+let settingsRevs = { drugList: 0, complList: 0, templates: 0 };
+let settingsAdopting = false; // true while applying a remote doc — suppresses rev bumps
+
+async function loadSettingsRevs() {
+  try {
+    const r = await storageBackend.get('settings_revs');
+    if (r) {
+      const o = JSON.parse(r.value);
+      for (const k of SETTING_KEYS) if (o && typeof o[k] === 'number') settingsRevs[k] = o[k];
+    }
+  } catch (_) {}
+}
+async function persistSettingsRevs() {
+  try { await storageSet('settings_revs', JSON.stringify(settingsRevs)); } catch (_) {}
+}
+function touchSetting(key) {
+  if (settingsAdopting) return;
+  if (SETTING_KEYS.indexOf(key) === -1) return;
+  settingsRevs[key] = Date.now();
+  persistSettingsRevs();
+  if (typeof scheduleSyncPush === 'function') scheduleSyncPush();
+}
+function getSettingDoc(key) {
+  if (key === 'drugList')  return { baseline: drugBaseline, current: currentDrugs };
+  if (key === 'complList') return { baseline: complBaseline, current: currentCompl };
+  if (key === 'templates') return { baseline: templateBaseline, current: currentTemplates };
+  return null;
+}
+function settingsToWire() {
+  return SETTING_KEYS.map(k => ({
+    key: k, rev: settingsRevs[k] || 0, json: JSON.stringify(getSettingDoc(k))
+  }));
+}
+function sanStrArr(a, fb) {
+  return Array.isArray(a)
+    ? a.filter(x => typeof x === 'string' && x.trim()).map(x => x.trim())
+    : fb.slice();
+}
+function sanComplArr(a, fb) {
+  return Array.isArray(a)
+    ? a.filter(x => x && typeof x === 'object' && typeof x.drug === 'string' && typeof x.text === 'string')
+        .map(x => ({ drug: x.drug, text: x.text }))
+    : fb.map(c => ({ ...c }));
+}
+function tplModalOpen(id) { const m = $(id); return m && !m.classList.contains('hidden'); }
+
+async function adoptSettingDoc(key, doc) {
+  settingsAdopting = true;
+  try {
+    if (key === 'drugList') {
+      drugBaseline = sanStrArr(doc && doc.baseline, DRUG_LIST);
+      currentDrugs = sanStrArr(doc && doc.current, drugBaseline);
+      try { await storageSet('drug_list_baseline', JSON.stringify(drugBaseline)); } catch (_) {}
+      await persistDrugs();
+      applyDrugListToDOM(currentDrugs);
+      refreshDrugStatus();
+      if (tplModalOpen('drugModal')) renderDrugManageList();
+    } else if (key === 'complList') {
+      complBaseline = sanComplArr(doc && doc.baseline, COMPL_LIST_DEFAULT);
+      currentCompl = sanComplArr(doc && doc.current, complBaseline);
+      try { await storageSet('compl_list_baseline', JSON.stringify(complBaseline)); } catch (_) {}
+      await persistCompl();
+      applyComplToDropdown();
+      if (tplModalOpen('complModal')) renderComplManageList();
+    } else if (key === 'templates') {
+      const b = sanitizeTemplates(doc && doc.baseline);
+      const c = sanitizeTemplates(doc && doc.current);
+      templateBaseline = Object.keys(b).length ? b : cloneTemplates(TEMPLATES_DEFAULT);
+      currentTemplates = Object.keys(c).length ? c : cloneTemplates(templateBaseline);
+      // Additive variant top-up (same as loadTemplateList) so a shared set from
+      // an earlier edit still carries the auto-selected variants locally.
+      const extraVariants = [
+        ...Object.values(QTY_OVER_VARIANT),
+        ...Object.values(TYPE_TEXT_VARIANT).map(cv => cv.variantKey)
+      ];
+      for (const ov of extraVariants) {
+        if (TEMPLATES_DEFAULT[ov]) {
+          if (!templateBaseline[ov]) templateBaseline[ov] = { ...TEMPLATES_DEFAULT[ov] };
+          if (!currentTemplates[ov]) currentTemplates[ov] = { ...TEMPLATES_DEFAULT[ov] };
+        }
+      }
+      try { await storageSet('templates_baseline', JSON.stringify(templateBaseline)); } catch (_) {}
+      await persistTemplates();
+      updateTemplateCoverageNote();
+      if (tplModalOpen('tplModal')) renderTemplateManageList();
+    }
+  } finally {
+    settingsAdopting = false;
+  }
+}
+
+// Merge remote settings: adopt any doc with a strictly higher rev than ours.
+async function mergeRemoteSettings(remoteSettings) {
+  if (!Array.isArray(remoteSettings)) return false;
+  let adopted = false;
+  for (const rs of remoteSettings) {
+    if (!rs || SETTING_KEYS.indexOf(rs.key) === -1) continue;
+    const rrev = Number(rs.rev) || 0;
+    if (rrev <= (settingsRevs[rs.key] || 0)) continue;
+    let doc = null;
+    try { doc = JSON.parse(rs.json || 'null'); } catch (_) {}
+    if (!doc || typeof doc !== 'object') continue;
+    await adoptSettingDoc(rs.key, doc);
+    settingsRevs[rs.key] = rrev;
+    adopted = true;
+  }
+  if (adopted) await persistSettingsRevs();
+  return adopted;
+}
+
 let syncReady = false;        // set after initial loadHistory — prevents an early
                               // pull/push racing against (and being wiped by) the local load
 let syncStartedAt = 0;
@@ -6363,16 +6485,18 @@ async function syncNow(reason) {
     const pdata = await parseSyncResponse(pr, 'Pull');
     checkScriptVersion(pdata);
     let changed = mergeRemoteCases(pdata.cases);
+    await mergeRemoteSettings(pdata.settings);
 
     // 2) PUSH the combined set (server merges again under a lock; 30s timeout)
     const qr = await fetchWithTimeout(SYNC_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // avoids CORS preflight with Apps Script
-      body: JSON.stringify({ action: 'push', cases: entriesToWire() })
+      body: JSON.stringify({ action: 'push', cases: entriesToWire(), settings: settingsToWire() })
     }, 30000);
     const qdata = await parseSyncResponse(qr, 'Push');
     checkScriptVersion(qdata);
     if (Array.isArray(qdata.cases)) changed = mergeRemoteCases(qdata.cases) || changed;
+    if (Array.isArray(qdata.settings)) await mergeRemoteSettings(qdata.settings);
 
     if (changed) {
       syncSuppress = true;
@@ -7155,10 +7279,8 @@ $('o_date').value = today;
 toggleInrBlock();
 updateM13Preview();
 updateOtherPreview();
-loadHistory().then(() => { syncReady = true; renderSyncChip(); syncNow('startup'); });
-loadDrugList();
-loadComplList();
-loadTemplateList();
+Promise.all([loadHistory(), loadDrugList(), loadComplList(), loadTemplateList(), loadSettingsRevs()])
+  .then(() => { syncReady = true; renderSyncChip(); syncNow('startup'); });
 // If both Claude storage and localStorage are unavailable, data lives only in
 // this open page — warn the user permanently and point them to Backup export.
 if (storageMode === 'memory') {
