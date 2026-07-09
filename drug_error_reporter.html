@@ -919,7 +919,7 @@
 <header>
   <div>
     <h1>Drug Error Reporter</h1>
-    <div class="sub">รายงานความคลาดเคลื่อนทางยา — สร้างข้อความ Q / R / S พร้อมคัดลอกเข้าฐานข้อมูล</div>
+    <div class="sub">รายงานความคลาดเคลื่อนทางยา — สร้างข้อความรายงานอัตโนมัติ พร้อมซิงก์ฐานข้อมูลกลางทุกเครื่อง</div>
   </div>
   <div class="btn-row" style="align-items:center;">
     <span class="drug-status drug-status-clickable" id="drugStatus" title="คลิกเพื่อจัดการรายการยา">
@@ -1377,7 +1377,7 @@
     </div>
 
     <div class="btn-row" style="margin-top:16px;padding-top:14px;border-top:1px solid var(--line);">
-      <button class="btn accent" id="m_save">บันทึกลงประวัติ</button>
+      <button class="btn accent" id="m_save">บันทึกรายงาน</button>
       <button class="btn ghost" id="m_summary">📊 สรุปข้อมูล</button>
       <span class="copy-flash" id="m_flash">บันทึกแล้ว</span>
     </div>
@@ -1551,7 +1551,7 @@
     </div>
 
     <div class="btn-row" style="margin-top:16px;padding-top:14px;border-top:1px solid var(--line);">
-      <button class="btn accent" id="o_save">บันทึกลงประวัติ</button>
+      <button class="btn accent" id="o_save">บันทึกรายงาน</button>
       <span class="copy-flash" id="o_flash">บันทึกแล้ว</span>
     </div>
 
@@ -1572,7 +1572,7 @@
 <div class="history-bar">
   <div class="history-header">
     <div class="preview-label" style="margin:0;">
-      <span>ประวัติที่บันทึกล่าสุด</span>
+      <span>รายงานความคลาดเคลื่อน</span>
     </div>
     <div class="save-status hidden" id="saveStatus"></div>
     <div class="sync-chip hidden" id="syncChip"></div>
@@ -1613,7 +1613,7 @@
 // ║  * เมื่ออัปเดตโค้ดสคริปต์ภายหลัง ต้องกด Deploy → Manage deployments     ║
 // ║    → Edit → Version: New version มิฉะนั้นชีตจะยังรันโค้ดเก่า             ║
 // ╚════════════════════════════════════════════════════════════════════╝
-const SYNC_URL = 'https://script.google.com/macros/s/AKfycbwSULdt-dHP9_pQwXZ3C_BLp3KKJnguxt7ELlalOVzGfh2co3L-FoL38H5BK3FzMkfrJQ/exec'; // ← วาง Web App URL (…/exec) ที่นี่
+const SYNC_URL = ''; // ← วาง Web App URL (…/exec) ที่นี่
 const EXPECTED_SCRIPT_VERSION = 2; // ต้องตรงกับ SCRIPT_VERSION ในโค้ด Apps Script (v2 = รองรับ sync รายการยา/ภาวะแทรกซ้อน/Template)
 
 // ============= STORAGE BACKEND =============
@@ -1676,10 +1676,22 @@ const storageBackend = claudeStorageAvailable ? claudeStorage : makeBrowserBacke
 const state = { mode: 'm13', history: [], editing: null };
 
 // ============= EDIT MODE =============
+// Editing tracks the entry's stable id (NOT its array index): sync can append
+// or replace entries in state.history at any time, so an index is unreliable —
+// following one was how an "update" could target the wrong slot or silently
+// become a brand-new record.
+function findEntryIndexById(id) {
+  if (!id) return -1;
+  for (let i = 0; i < state.history.length; i++) {
+    if (state.history[i].id === id) return i;
+  }
+  return -1;
+}
 function setEditMode(idx) {
   const entry = state.history[idx];
   if (!entry) return;
-  state.editing = { index: idx, mode: entry.mode };
+  ensureEntryIdentity(entry);
+  state.editing = { id: entry.id, mode: entry.mode };
   updateEditBanner();
 }
 
@@ -1695,36 +1707,37 @@ function updateEditBanner() {
   const oSave = $('o_save');
 
   if (state.editing) {
-    const entry = state.history[state.editing.index];
+    const ei = findEntryIndexById(state.editing.id);
+    const entry = ei >= 0 ? state.history[ei] : null;
     const info = entry ? `${entry.summary || '(no summary)'} — บันทึกเมื่อ ${entry.savedAt}` : '';
     if (state.editing.mode === 'm13') {
       m13Banner.classList.remove('hidden');
       $('m_editInfo').textContent = info;
-      mSave.textContent = 'อัปเดตประวัติ';
+      mSave.textContent = 'บันทึกการแก้ไข (รายงานเดิม)';
       mSave.classList.remove('ghost');
       mSave.classList.add('accent');
       otherBanner.classList.add('hidden');
-      oSave.textContent = 'บันทึกลงประวัติ';
+      oSave.textContent = 'บันทึกรายงาน';
       oSave.classList.add('ghost');
       oSave.classList.remove('accent');
     } else {
       otherBanner.classList.remove('hidden');
       $('o_editInfo').textContent = info;
-      oSave.textContent = 'อัปเดตประวัติ';
+      oSave.textContent = 'บันทึกการแก้ไข (รายงานเดิม)';
       oSave.classList.remove('ghost');
       oSave.classList.add('accent');
       m13Banner.classList.add('hidden');
-      mSave.textContent = 'บันทึกลงประวัติ';
+      mSave.textContent = 'บันทึกรายงาน';
       mSave.classList.add('ghost');
       mSave.classList.remove('accent');
     }
   } else {
     m13Banner.classList.add('hidden');
     otherBanner.classList.add('hidden');
-    mSave.textContent = 'บันทึกลงประวัติ';
+    mSave.textContent = 'บันทึกรายงาน';
     mSave.classList.add('ghost');
     mSave.classList.remove('accent');
-    oSave.textContent = 'บันทึกลงประวัติ';
+    oSave.textContent = 'บันทึกรายงาน';
     oSave.classList.add('ghost');
     oSave.classList.remove('accent');
   }
@@ -2172,6 +2185,38 @@ async function loadHistory() {
   // Migration: assign id/rev to entries created before sync existed
   let migrated = false;
   for (const e of state.history) { if (ensureEntryIdentity(e)) migrated = true; }
+
+  // Repair 1: exact same-id duplicates (should never happen, but breaks the
+  // merge map if it does) — keep the highest rev, physically drop the rest.
+  const seenIds = new Map();
+  const pruned = [];
+  for (const e of state.history) {
+    const prev = seenIds.get(e.id);
+    if (prev === undefined) { seenIds.set(e.id, pruned.length); pruned.push(e); }
+    else if ((Number(e.rev) || 0) > (Number(pruned[prev].rev) || 0)) { pruned[prev] = e; migrated = true; }
+    else { migrated = true; }
+  }
+  state.history = pruned;
+
+  // Repair 2: migration twins — the SAME case that received DIFFERENT ids
+  // because two devices migrated identical pre-sync histories independently.
+  // Signature: same mode + same savedAt + identical generated texts.
+  // Keep the higher rev (likely the edited one), tombstone the other so the
+  // cleanup syncs to every device and the sheet.
+  const byContent = new Map();
+  for (const e of state.history) {
+    if (e.deleted) continue;
+    const key = e.mode + '|' + (e.savedAt || '') + '|' + JSON.stringify(e.texts || {});
+    const prevIdx = byContent.get(key);
+    if (prevIdx === undefined) { byContent.set(key, state.history.indexOf(e)); continue; }
+    const prev = state.history[prevIdx];
+    const loser = (Number(e.rev) || 0) >= (Number(prev.rev) || 0) ? prev : e;
+    loser.deleted = true;
+    loser.rev = Date.now();
+    if ((Number(e.rev) || 0) >= (Number(prev.rev) || 0)) byContent.set(key, state.history.indexOf(e));
+    migrated = true;
+  }
+
   if (migrated) { try { await storageSet('history', JSON.stringify(state.history)); } catch(_){} }
   renderHistory();
 }
@@ -2285,7 +2330,7 @@ function renderHistory() {
   else if (state.historyFilter === 'recorded') visible = visible.filter(v => v.e.recorded);
 
   if (alive.length === 0) {
-    list.innerHTML = '<div class="history-empty">ยังไม่มีประวัติ</div>';
+    list.innerHTML = '<div class="history-empty">ยังไม่มีรายงาน</div>';
     return;
   }
   if (visible.length === 0) {
@@ -2455,7 +2500,7 @@ async function deleteFromHistory(idx) {
   if (!entry) return;
   // If currently editing this entry, exit edit mode.
   // (Tombstone keeps the array intact, so other edit indexes don't shift.)
-  if (state.editing && state.editing.index === idx) {
+  if (state.editing && state.editing.id === entry.id) {
     clearEditMode();
   }
   // Tombstone instead of splice: deletion must sync to other devices.
@@ -2467,8 +2512,13 @@ async function deleteFromHistory(idx) {
 
 async function updateExistingEntry(mode, texts, summary, type) {
   if (!state.editing || state.editing.mode !== mode) return false;
-  const entry = state.history[state.editing.index];
-  if (!entry || entry.deleted) { clearEditMode(); return false; }
+  const ei = findEntryIndexById(state.editing.id);
+  const entry = ei >= 0 ? state.history[ei] : null;
+  if (!entry || entry.deleted) {
+    alert('ไม่พบรายงานเดิม (อาจถูกลบไปแล้วจากเครื่องอื่น) — ยังไม่ได้บันทึกการแก้ไขนี้\n\nหากต้องการเก็บเป็นรายงานใหม่ ให้กดปุ่มบันทึกอีกครั้ง');
+    clearEditMode();
+    return false;
+  }
   entry.texts = texts;
   entry.summary = summary;
   entry.type = type;
@@ -6243,7 +6293,7 @@ function mergeRemoteCases(remoteCases) {
         // higher rev still wins even mid-edit (the user can re-load it).
         state.history[li] = robj;
         changed = true;
-        if (state.editing && state.editing.index === li && robj.deleted) clearEditMode();
+        if (state.editing && state.editing.id === robj.id && robj.deleted) clearEditMode();
       }
     }
   }
@@ -7186,7 +7236,7 @@ $('historyList').addEventListener('click', async e => {
     en.updatedAt = new Date().toLocaleString('th-TH', { dateStyle: 'short', timeStyle: 'short' });
     touchEntry(en);
     // Keep the form in sync if this entry is currently loaded for editing
-    if (state.editing && state.editing.index === idx && en.mode === 'm13') {
+    if (state.editing && state.editing.id === en.id && en.mode === 'm13') {
       $('m_kpi').value = newVal;
     }
     await saveHistory();
