@@ -6506,6 +6506,58 @@ async function mergeRemoteSettings(remoteSettings) {
   return adopted;
 }
 
+// ----- Client-side auto-recovery of twin-killed cases -----
+// If the sheet contains groups of identical-content copies (different ids from
+// the old per-device migration) where EVERY copy is tombstoned, re-create ONE
+// report per group under a deterministic 'rec-' id with a marked savedAt.
+// Runs automatically after every pull; needs no Apps Script action at all.
+// - Deterministic id => many devices recovering concurrently converge to ONE row.
+// - Existing rec- id (alive OR deleted) => skip: a deleted rec- means a genuine
+//   user deletion and must stay deleted.
+const REC_MARK = ' (\u0e01\u0e39\u0e49\u0e04\u0e37\u0e19)';
+function recContentKey(o) {
+  return (o.mode || '') + '|' + (o.savedAt || '') + '|' + JSON.stringify(o.texts || {});
+}
+function recIdFromKey(key) {
+  let h1 = 5381, h2 = 52711;
+  for (let i = 0; i < key.length; i++) {
+    const c = key.charCodeAt(i);
+    h1 = ((h1 * 33) ^ c) >>> 0;
+    h2 = ((h2 * 31) + c) >>> 0;
+  }
+  return 'rec-' + h1.toString(36) + '-' + h2.toString(36);
+}
+function autoRecoverTwins() {
+  const existingIds = new Set(state.history.map(e => e.id));
+  const groups = new Map();
+  for (const e of state.history) {
+    if (!e || !e.id || String(e.id).indexOf('rec-') === 0) continue;
+    const key = recContentKey(e);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(e);
+  }
+  let created = 0;
+  for (const [key, g] of groups) {
+    if (g.length < 2) continue;                       // single copy deleted = real deletion
+    if (!g.every(e => e.deleted)) continue;           // group still has a survivor
+    const rid = recIdFromKey(key);
+    if (existingIds.has(rid)) continue;               // recovered before (or deliberately deleted)
+    g.sort((a, b) => (a.id < b.id ? -1 : 1));
+    const src = g[0];
+    let obj;
+    try { obj = JSON.parse(JSON.stringify(src)); } catch (_) { continue; }
+    obj.id = rid;
+    obj.rev = Date.now() + created;
+    obj.deleted = false;
+    obj.savedAt = (obj.savedAt || '') + REC_MARK;     // own dedupe-signature: untouchable by old builds
+    state.history.push(obj);
+    existingIds.add(rid);
+    created++;
+  }
+  if (created > 0) console.log('autoRecoverTwins: recovered ' + created + ' report(s)');
+  return created > 0;
+}
+
 let syncReady = false;        // set after initial loadHistory — prevents an early
                               // pull/push racing against (and being wiped by) the local load
 let syncStartedAt = 0;
@@ -6536,6 +6588,7 @@ async function syncNow(reason) {
     const pdata = await parseSyncResponse(pr, 'Pull');
     checkScriptVersion(pdata);
     let changed = mergeRemoteCases(pdata.cases);
+    if (autoRecoverTwins()) changed = true;
     await mergeRemoteSettings(pdata.settings);
 
     // 2) PUSH the combined set (server merges again under a lock; 30s timeout)
